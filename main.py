@@ -28,6 +28,27 @@ Method (no network, stdlib only, fully deterministic):
   persistence baseline (every hour at hour 1's print, spread widening as
   0.15*sqrt(h-1)) so the case is still valid.
 
+  Two more signals, present only in the final case (null in practice):
+  `streams` (the category's top 20 live streams at the last valid read)
+  and `categories_hourly` (Twitch's top 20 categories, once an hour).
+  Both are used conservatively and are inert when absent or malformed,
+  so the practice behaviour is unchanged:
+  - streams: the largest stream's share of the top-20 total measures how
+    concentrated the category's visible audience is.  A category carried
+    by one stream is more volatile hour to hour (that stream's schedule
+    moves the whole category) than a broad-based one, so the spread is
+    widened by up to 25% in proportion to that share.  The median is
+    untouched: concentration says nothing about the level.
+  - categories_hourly: the sum of the top-20 categories' viewers at the
+    last hour before the checkpoint is a reference for all of Twitch's
+    attention at hour 1.  The comparable model extrapolates from past
+    launches; for the biggest launch ever its implied growth could put
+    one category above three quarters of that whole pool, which is not
+    plausible.  So the forecast median is capped at 0.75 x that total,
+    with the cut itself bounded at 20%: the ceiling is only a top-20
+    sum (real Twitch traffic is larger and grows through the day), so
+    the trim stays a bounded sanity bound, never a literal belief.
+
   Practice validation (local, against SullyGnome's hourly averages):
   mean pinball loss about 0.19 over the four practice cases, versus about
   0.40 for the house baseline.  See gta6-twitch-validate.md (kept outside
@@ -53,6 +74,12 @@ BANDWIDTH = 1.0
 SPREAD_MULT = 0.5
 SPREAD_MIN = 0.12
 SPREAD_MAX = 0.80
+# streams: spread widening per unit of top-stream share, at most +25%.
+CONCENTRATION_SPREAD = 0.25
+# categories_hourly: median may not exceed this share of the hour-1
+# top-20 category total, and the cut itself is bounded at 20%.
+ATTENTION_CEILING = 0.75
+MAX_MEDIAN_CUT = 0.80
 
 
 def parse_time(text):
@@ -85,6 +112,85 @@ def hour1_print(case):
         if last is not None:
             return max(1.0, float(last))
     return 1.0
+
+
+def streams_spread_mult(case):
+    """Spread multiplier from stream concentration, 1.0 when unusable.
+
+    Uses only the top-20 list itself: the largest stream's share of the
+    top-20 total.  Returns 1.0 (no change) when `streams` is null, not a
+    list, empty, has more than 20 entries, or any entry lacks a finite
+    non-negative viewers count -- so malformed data can never move the
+    forecast.  The multiplier is 1 + 0.25 * top_share, at most 1.25.
+    """
+    streams = case.get("streams")
+    if not isinstance(streams, list) or not 1 <= len(streams) <= 20:
+        return 1.0
+    viewers = []
+    for entry in streams:
+        if not isinstance(entry, dict):
+            return 1.0
+        value = entry.get("viewers")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 1.0
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            return 1.0
+        viewers.append(value)
+    total = sum(viewers)
+    if total <= 0:
+        return 1.0
+    return 1.0 + CONCENTRATION_SPREAD * (max(viewers) / total)
+
+
+def categories_median_cap(case):
+    """Absolute median ceiling from categories_hourly, None when unusable.
+
+    Takes the last hourly top-20 entry at or before the checkpoint (the
+    hour-1 snapshot) and returns 0.75 * the sum of its categories'
+    viewers.  Returns None when `categories_hourly` is null, not a list,
+    has no entry with a parseable time at or before the checkpoint, or
+    the chosen entry's top list is empty, has more than 20 entries, or
+    holds a non-finite or negative viewers count.  The ceiling is only
+    ever applied with the 20% max-cut bound in model_quantiles.
+    """
+    entries = case.get("categories_hourly")
+    if not isinstance(entries, list) or not entries:
+        return None
+    try:
+        checkpoint = parse_time(case["checkpoint"])
+    except (KeyError, TypeError, ValueError):
+        checkpoint = None
+    chosen = None
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            when = parse_time(entry["from"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if checkpoint is not None and when > checkpoint:
+            continue
+        chosen = entry
+    if chosen is None:
+        return None
+    top = chosen.get("top")
+    if not isinstance(top, list) or not 1 <= len(top) <= 20:
+        return None
+    total = 0.0
+    for entry in top:
+        if not isinstance(entry, dict):
+            return None
+        value = entry.get("viewers")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        if not math.isfinite(value) or value < 0:
+            return None
+        total += value
+    if total <= 0:
+        return None
+    return ATTENTION_CEILING * total
 
 
 def comparable_profiles(case):
@@ -163,8 +269,14 @@ def smooth(values, radius=1):
     return out
 
 
-def model_quantiles(p1, profiles, levels):
-    """Median + spread per forecast hour from the comparable profiles."""
+def model_quantiles(p1, profiles, levels, spread_mult=1.0, median_cap=None):
+    """Median + spread per forecast hour from the comparable profiles.
+
+    spread_mult widens every hour's spread (streams concentration);
+    median_cap is an absolute viewer ceiling on the median (attention
+    share), applied with the cut bounded at 20% so a shaky ceiling can
+    never slash the forecast.  Both default to inert.
+    """
     log_p1 = math.log10(p1)
     logs = [math.log10(first) for _name, first, _r in profiles]
     lo, hi = min(logs), max(logs)
@@ -190,11 +302,19 @@ def model_quantiles(p1, profiles, levels):
     spreads = smooth(spreads)
     rows = []
     for hour in range(2, 25):
-        spread = clamp(spreads[hour - 2] * SPREAD_MULT, SPREAD_MIN, SPREAD_MAX)
+        spread = clamp(
+            spreads[hour - 2] * SPREAD_MULT * spread_mult, SPREAD_MIN, SPREAD_MAX
+        )
+        mu = medians[hour]
+        if median_cap is not None:
+            mu = max(
+                mu + math.log(MAX_MEDIAN_CUT),
+                min(mu, math.log(median_cap / p1)),
+            )
         quantiles = []
         previous = 0.0
         for z in zvals:
-            q = p1 * math.exp(medians[hour] + z * spread)
+            q = p1 * math.exp(mu + z * spread)
             q = clamp(q, 0.01, 1e9)
             q = round2_half_up(q)
             if q < previous:
@@ -230,7 +350,13 @@ def forecast_case(case):
     try:
         profiles = comparable_profiles(case)
         if len(profiles) >= 5:
-            forecast = model_quantiles(p1, profiles, levels)
+            forecast = model_quantiles(
+                p1,
+                profiles,
+                levels,
+                spread_mult=streams_spread_mult(case),
+                median_cap=categories_median_cap(case),
+            )
             if forecast is not None:
                 return forecast
     except Exception:
